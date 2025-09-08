@@ -21,8 +21,24 @@ class Agent:
         self.action_space = action_space
         self.observation_space = observation_space
 
-        # Default hyperparameters tuned for stable landings with low jitter.
-        defaults = {
+        # Load defaults and apply user overrides
+        defaults = self.default_config()
+        user_cfg = config or {}
+        self.cfg = {**defaults, **user_cfg}
+
+        # Internal state for smoothing & episode-local memory
+        self._last_action = 0
+        self._switch_cooldown = 0  # steps remaining to allow next switch
+        self._bank_active = False
+
+    @classmethod
+    def default_config(cls):
+        """Return a dict of default hyperparameters.
+
+        Exposed for external consumers (e.g., Optuna objective) to start from a
+        known-good baseline and selectively override fields.
+        """
+        return {
             # Map horizontal state -> desired body angle
             "x_to_angle_k_p": 0.50,   # rad per meter
             "vx_to_angle_k_d": 1.00,  # rad per (m/s)
@@ -119,13 +135,149 @@ class Agent:
             "final_ascent_guard": 0.02,
         }
 
-        user_cfg = config or {}
-        self.cfg = {**defaults, **user_cfg}
+    def get_config(self):
+        """Return a shallow copy of the current configuration."""
+        return dict(self.cfg)
 
-        # Internal state for smoothing & episode-local memory
-        self._last_action = 0
-        self._switch_cooldown = 0  # steps remaining to allow next switch
-        self._bank_active = False
+    def update_config(self, updates):
+        """Update configuration fields in-place with given dict."""
+        if not isinstance(updates, dict):
+            return
+        self.cfg.update(updates)
+
+    @classmethod
+    def default_search_space(cls):
+        """A conservative Optuna-compatible search space spec.
+
+        Returned format (per key):
+        {"type": "float|int|bool|categorical", "low": x, "high": y, "step": s?, "choices": [...]?}
+        """
+        return {
+            # Horizontal mapping & PD
+            "x_to_angle_k_p_low": {"type": "float", "low": 0.10, "high": 0.60, "step": 0.01},
+            "x_to_angle_k_p_high": {"type": "float", "low": 0.40, "high": 1.00, "step": 0.01},
+            "vx_to_angle_k_d_low": {"type": "float", "low": 0.30, "high": 1.20, "step": 0.01},
+            "vx_to_angle_k_d_high": {"type": "float", "low": 0.80, "high": 1.60, "step": 0.01},
+            "angle_limit_low": {"type": "float", "low": 0.10, "high": 0.35, "step": 0.01},
+            "angle_limit_high": {"type": "float", "low": 0.35, "high": 0.70, "step": 0.01},
+            "angle_err_k_p": {"type": "float", "low": 0.20, "high": 1.20, "step": 0.01},
+            "ang_vel_k_d": {"type": "float", "low": 0.40, "high": 1.80, "step": 0.01},
+
+            # Vertical/hover
+            "hover_k_p_low": {"type": "float", "low": 0.40, "high": 1.20, "step": 0.01},
+            "hover_k_p_high": {"type": "float", "low": 0.20, "high": 0.90, "step": 0.01},
+            "vy_k_d_low": {"type": "float", "low": 0.40, "high": 1.20, "step": 0.01},
+            "vy_k_d_high": {"type": "float", "low": 0.20, "high": 0.90, "step": 0.01},
+            "hover_x_gain": {"type": "float", "low": 0.20, "high": 1.20, "step": 0.01},
+            "glide_vx_gain": {"type": "float", "low": 0.00, "high": 0.80, "step": 0.01},
+
+            # Envelope & deadbands
+            "descent_vy_max_low": {"type": "float", "low": -0.40, "high": -0.05, "step": 0.01},
+            "descent_vy_max_high": {"type": "float", "low": -1.20, "high": -0.40, "step": 0.01},
+            "envelope_margin": {"type": "float", "low": 0.02, "high": 0.10, "step": 0.005},
+            "angle_deadband_low": {"type": "float", "low": 0.03, "high": 0.12, "step": 0.005},
+            "angle_deadband_high": {"type": "float", "low": 0.03, "high": 0.10, "step": 0.005},
+            "hover_deadband_low": {"type": "float", "low": 0.03, "high": 0.12, "step": 0.005},
+            "hover_deadband_high": {"type": "float", "low": 0.03, "high": 0.10, "step": 0.005},
+
+            # Bank mode
+            "bank_mode_enabled": {"type": "categorical", "choices": [True, False]},
+            "bank_ratio_on": {"type": "float", "low": 0.40, "high": 0.90, "step": 0.01},
+            "bank_ratio_off": {"type": "float", "low": 0.20, "high": 0.70, "step": 0.01},
+            "y_min_for_ratio": {"type": "float", "low": 0.05, "high": 0.40, "step": 0.01},
+            "bank_deadband_scale": {"type": "float", "low": 1.0, "high": 3.0, "step": 0.05},
+            "bank_hold_steps": {"type": "int", "low": 0, "high": 5, "step": 1},
+            "x_far_for_main_bias": {"type": "float", "low": 0.20, "high": 0.60, "step": 0.01},
+            "angle_limit_bank_low": {"type": "float", "low": 0.20, "high": 0.50, "step": 0.01},
+            "angle_limit_bank_high": {"type": "float", "low": 0.40, "high": 0.80, "step": 0.01},
+            "kx_vec": {"type": "float", "low": 0.40, "high": 1.50, "step": 0.01},
+            "kvx_vec": {"type": "float", "low": 0.60, "high": 2.00, "step": 0.01},
+            "ky_vec": {"type": "float", "low": 0.20, "high": 1.20, "step": 0.01},
+            "kvy_vec": {"type": "float", "low": 0.20, "high": 1.20, "step": 0.01},
+
+            # Final approach
+            "final_approach_enabled": {"type": "categorical", "choices": [True, False]},
+            "final_y": {"type": "float", "low": 0.15, "high": 0.60, "step": 0.01},
+            "align_x_tol": {"type": "float", "low": 0.02, "high": 0.10, "step": 0.001},
+            "align_vx_tol": {"type": "float", "low": 0.05, "high": 0.30, "step": 0.005},
+            "align_angle_tol": {"type": "float", "low": 0.02, "high": 0.12, "step": 0.001},
+            "align_angvel_tol": {"type": "float", "low": 0.10, "high": 0.60, "step": 0.01},
+            "align_gamma": {"type": "float", "low": 0.8, "high": 3.0, "step": 0.05},
+            "align_vy_target_min": {"type": "float", "low": -0.10, "high": -0.00, "step": 0.005},
+            "align_vy_target_max": {"type": "float", "low": -0.40, "high": -0.10, "step": 0.005},
+            "align_bias_hover": {"type": "float", "low": 0.00, "high": 0.20, "step": 0.005},
+            "vy_deadband": {"type": "float", "low": 0.00, "high": 0.05, "step": 0.001},
+            "final_predict_horizon": {"type": "float", "low": 0.10, "high": 0.80, "step": 0.01},
+            "final_main_hold_steps": {"type": "int", "low": 0, "high": 6, "step": 1},
+            "final_offpad_score_scale": {"type": "float", "low": 0.20, "high": 1.00, "step": 0.01},
+            "final_ascent_guard": {"type": "float", "low": 0.00, "high": 0.08, "step": 0.005},
+
+            # Contact brake
+            "contact_lateral_brake": {"type": "categorical", "choices": [True, False]},
+            "contact_vx_enter": {"type": "float", "low": 0.10, "high": 0.40, "step": 0.01},
+            "contact_vx_exit": {"type": "float", "low": 0.05, "high": 0.30, "step": 0.01},
+            "contact_brake_hold": {"type": "int", "low": 0, "high": 5, "step": 1},
+        }
+
+    @classmethod
+    def suggest_config_from_trial(cls, trial, space=None):
+        """Build a config dict by querying an Optuna trial.
+
+        The function avoids importing optuna; it only relies on the trial API
+        shape (suggest_float/int/categorical). You may pass a custom `space`
+        spec (same structure as `default_search_space`).
+        """
+        spec = space if isinstance(space, dict) else cls.default_search_space()
+
+        cfg = cls.default_config()
+        for key, meta in spec.items():
+            t = meta.get("type")
+            if t == "float":
+                low_v = meta.get("low")
+                high_v = meta.get("high")
+                if low_v is None or high_v is None:
+                    continue
+                step_v = meta.get("step")
+                low_f = float(low_v)
+                high_f = float(high_v)
+                if step_v is None:
+                    value = trial.suggest_float(key, low_f, high_f)
+                else:
+                    value = trial.suggest_float(key, low_f, high_f, step=float(step_v))
+            elif t == "int":
+                low_v = meta.get("low")
+                high_v = meta.get("high")
+                if low_v is None or high_v is None:
+                    continue
+                step_v = meta.get("step")
+                step_i = int(step_v) if step_v is not None else 1
+                low_i = int(low_v)
+                high_i = int(high_v)
+                value = trial.suggest_int(key, low_i, high_i, step=step_i)
+            elif t == "categorical":
+                choices = list(meta.get("choices", []))
+                if not choices:
+                    continue
+                value = trial.suggest_categorical(key, choices)
+            else:
+                # Unknown type; skip
+                continue
+            cfg[key] = value
+        return cfg
+
+    @classmethod
+    def from_trial(cls, action_space, observation_space=None, trial=None, overrides=None, space=None):
+        """Construct an Agent with config suggested from an Optuna trial.
+
+        - `overrides` can force certain values after the trial suggestion.
+        - `space` can override the default search space.
+        """
+        if trial is None:
+            raise ValueError("trial must be provided for from_trial()")
+        cfg = cls.suggest_config_from_trial(trial, space=space)
+        if isinstance(overrides, dict) and overrides:
+            cfg.update(overrides)
+        return cls(action_space, observation_space=observation_space, config=cfg)
 
     def reset(self):
         # Clear per-episode internal state
